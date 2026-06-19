@@ -15,6 +15,7 @@ import datetime
 import glob
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import dash
@@ -33,15 +34,25 @@ from dash import Input, Output, Patch, State, callback, dcc, html
 # When multiple roots exist, the file with the highest version number
 # (_vX.Y in the filename) is preferred; newest mtime breaks ties.
 # ---------------------------------------------------------------------------
+# BADC met-sensors (2001–2018, monthly, old cfarr format — pressure/temperature/rh/wind)
+MET_SENSORS_ROOT = os.environ.get(
+    "MET_SENSORS_ROOT",
+    "/badc/chilbolton/data/met-sensors_chilbolton",
+)
+
 PRESSURE_ROOTS = [
-    # GWS (level1a, 2019–present, yearly).  BADC copy not readable.
+    # GWS (level1a, 2024–present, yearly).  BADC copy not readable.
     (os.environ.get(
         "PRESSURE_DATA_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-pressure-1/data/long-term/level1a",
+        "/gws/pw/j07/ncas_obs_vol1/public/cao/stfc-pressure-1",
     ), "yearly"),
+    # BADC met-sensors (2001–2018, monthly)
+    (MET_SENSORS_ROOT, "monthly_mm", None, "20240331"),
 ]
 TRH_ROOTS = [
-    # BADC archive (2015–2024, yearly, v1.1)
+    # BADC met-sensors (2001–2018, monthly) — fills gap before NCAS instrument archive
+    (MET_SENSORS_ROOT, "monthly_mm", None, "20181231"),
+    # BADC archive (2015–2024, yearly, v1.1) — takes priority via version number
     (os.environ.get(
         "TRH_DATA_ROOT",
         "/badc/ncas-cao/data/ncas-temperature-rh-1/20150415_longterm/v1.1",
@@ -49,27 +60,60 @@ TRH_ROOTS = [
     # GWS long-term archive (2024-04-01 onwards, yearly)
     (os.environ.get(
         "TRH_GWS_LONGTERM_ROOT",
-        "/gws/pww/j07/ncas_obs_vol2/cao/processing/ncas-temperature-rh-1/20150415_longterm",
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-temperature-rh-1/20240401_longterm",
+    ), "yearly"),
+    # STFC upload (2024-04-01 onwards, yearly, v1.1)
+    (os.environ.get(
+        "TRH_STFC_ROOT",
+        "/gws/pw/j07/ncas_obs_vol1/public/cao/stfc-temperature-rh-1",
     ), "yearly", "20240401"),
 ]
 RAIN_ROOTS = [
-    # GWS (2020–present, monthly).  BADC copy uses incompatible old format.
+    # GWS monthly layout (2025–present, monthly) — v1.0 AMOF format
+    (os.environ.get(
+        "RAIN_GWS_MONTHLY_ROOT",
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term",
+    ), "monthly", "20250101"),
+    # GWS level1b (2020–2024, yearly, v1.0)
     (os.environ.get(
         "RAIN_DATA_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term",
-    ), "monthly"),
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term/level1b",
+    ), "yearly", "20200101", "20241231"),
+    # GWS level1_f5 (2015–2020, yearly, v1.0) — AMOF format, fills the pre-2020 gap
+    (os.environ.get(
+        "RAIN_GWS_LEVEL1F5_ROOT",
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term/level1_f5",
+    ), "yearly", "20140401", "20201231"),
+    # BADC ncas-rain-gauge-1 (2001–2020, monthly_mm) — old tipping-bucket format;
+    # used only when no AMOF file exists (version (0,0) loses to v1.0).
+    (os.environ.get(
+        "RAIN_BADC_ROOT",
+        "/badc/ncas-cao/data/ncas-rain-gauge-1/20010101_longterm/previous_v1",
+    ), "monthly_mm", "20010101", "20201231"),
 ]
 ANEM_ROOTS = [
-    # GWS level1a (2020–2024, yearly)
+    # GWS level1b (2010–present, yearly) — preferred; will cover 2025+ once data lands there
     (os.environ.get(
         "ANEM_DATA_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term/level1a",
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term/level1b",
     ), "yearly"),
-    # BADC archive (2001–2020, monthly, old cfarr format — wind_direction variable)
+    # GWS monthly layout (2025–present) — covers dates not yet in level1b
+    (os.environ.get(
+        "ANEM_GWS_MONTHLY_ROOT",
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term",
+    ), "monthly", "20250101"),
+     # GWS level1_f5 (2015–2020, yearly, v1.0) — AMOF format, fills the pre-level1b gap
+    (os.environ.get(
+        "ANEM_LEVEL1F5_ROOT",
+        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term/level1_f5",
+    ), "yearly", "20140401", "20201231"),
+    # BADC archive (2001–2020, monthly_mm, old cfarr format — wind_direction variable)
     (os.environ.get(
         "ANEM_BADC_ROOT",
         "/badc/ncas-cao/data/ncas-anemometer-2/20010101_longterm/previous_v1",
-    ), "monthly"),
+    ), "monthly_mm"),
+    # BADC met-sensors (2001–2018, monthly_mm) — fallback when ncas-anemometer-2 absent
+    (MET_SENSORS_ROOT, "monthly_mm", None, "20181231"),
 ]
 
 # Keep simple aliases for _build_download_dataset compatibility
@@ -113,18 +157,23 @@ VARIABLES = {
     "wind_speed": {
         "label": "Wind Speed",
         "var": "wind_speed",
-        "qc": None,
+        "qc": "qc_flag_wind_speed",
         "ylabel": "Wind speed<br>(m s\u207b\u00b9)",
         "source": "anem",
     },
     "wind_from_direction": {
         "label": "Wind Direction",
         "var": "wind_from_direction",
-        "qc": None,
+        "qc": "qc_flag_wind_from_direction",
         "ylabel": "Wind direction<br>(\u00b0)",
         "source": "anem",
     },
 }
+
+# Global lock to serialise HDF5/netCDF4 file access across threads.
+# The HDF5 library is not thread-safe in its default (serial) build;
+# concurrent open() calls from multiple threads cause SIGSEGV.
+_nc_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Helpers — multi-root file discovery
@@ -151,22 +200,31 @@ def _glob_day_files(roots, year, month, day):
     """
     Collect all candidate files for a date from multiple (root, layout) pairs,
     then return the single best file (highest version / newest mtime).
-    Each root entry is (root, layout) or (root, layout, min_date) where
-    min_date is a string like "20240401" to restrict the root to dates on or after.
+    Each root entry is (root, layout[, min_date[, max_date]]) where
+    min_date/max_date are strings like "20240401" to restrict the date range.
+    Layouts: "yearly" -> root/<year>/*.nc
+             "monthly" -> root/<year>/<YYYYMM>/*.nc
+             "monthly_mm" -> root/<year>/<MM>/*.nc
     """
     date_str = f"{year}{month:02d}{day:02d}"
     month_str = f"{year}{month:02d}"
+    month_mm = f"{month:02d}"
     candidates = []
     for root_entry in roots:
         root, layout = root_entry[0], root_entry[1]
         min_date = root_entry[2] if len(root_entry) > 2 else None
+        max_date = root_entry[3] if len(root_entry) > 3 else None
         if min_date and date_str < min_date:
+            continue
+        if max_date and date_str > max_date:
             continue
         if not os.path.isdir(root):
             continue
         if layout == "yearly":
             d = os.path.join(root, str(year))
-        else:
+        elif layout == "monthly_mm":
+            d = os.path.join(root, str(year), month_mm)
+        else:  # monthly (YYYYMM subdirs)
             d = os.path.join(root, str(year), month_str)
         candidates += glob.glob(os.path.join(d, f"*{date_str}*.nc"))
     return _best_file(candidates)
@@ -176,21 +234,29 @@ def _glob_month_files(roots, year, month):
     """
     Collect all candidate files for a month from multiple (root, layout) pairs.
     For each calendar date found, keep only the best-version file.
-    Each root entry is (root, layout) or (root, layout, min_date) where
-    min_date is a string like "20240401" to restrict the root to dates on or after.
+    Each root entry is (root, layout[, min_date[, max_date]]) where
+    min_date/max_date are strings like "20240401" to restrict the date range.
+    Layouts: "yearly" -> root/<year>/*.nc
+             "monthly" -> root/<year>/<YYYYMM>/*.nc
+             "monthly_mm" -> root/<year>/<MM>/*.nc
     Returns a sorted list of file paths.
     """
     month_str = f"{year}{month:02d}"
+    month_mm = f"{month:02d}"
     by_date = {}
     for root_entry in roots:
         root, layout = root_entry[0], root_entry[1]
         min_date = root_entry[2] if len(root_entry) > 2 else None
+        max_date = root_entry[3] if len(root_entry) > 3 else None
         if not os.path.isdir(root):
             continue
         if layout == "yearly":
             d = os.path.join(root, str(year))
             files = glob.glob(os.path.join(d, f"*{month_str}*.nc"))
-        else:
+        elif layout == "monthly_mm":
+            d = os.path.join(root, str(year), month_mm)
+            files = glob.glob(os.path.join(d, "*.nc"))
+        else:  # monthly (YYYYMM subdirs)
             d = os.path.join(root, str(year), month_str)
             files = glob.glob(os.path.join(d, "*.nc"))
         for f in files:
@@ -198,24 +264,32 @@ def _glob_month_files(roots, year, month):
             if m and m.group(1).startswith(month_str):
                 if min_date and m.group(1) < min_date:
                     continue
+                if max_date and m.group(1) > max_date:
+                    continue
                 by_date.setdefault(m.group(1), []).append(f)
     return [_best_file(v) for _, v in sorted(by_date.items()) if v]
 
 
 def available_years():
     years = set()
-    for root, _ in PRESSURE_ROOTS:
+    for root_entry in PRESSURE_ROOTS:
+        root = root_entry[0]
+        max_date = root_entry[3] if len(root_entry) > 3 else None
         if not os.path.isdir(root):
             continue
         for d in os.listdir(root):
             if d.isdigit() and len(d) == 4 and os.path.isdir(os.path.join(root, d)):
+                if max_date and d > max_date[:4]:
+                    continue
                 years.add(int(d))
     return sorted(years)
 
 
 def available_months(year):
     months = set()
-    for root, layout in PRESSURE_ROOTS:
+    for root_entry in PRESSURE_ROOTS:
+        root, layout = root_entry[0], root_entry[1]
+        max_date = root_entry[3] if len(root_entry) > 3 else None
         if layout == "yearly":
             year_dir = os.path.join(root, str(year))
             if not os.path.isdir(year_dir):
@@ -223,13 +297,27 @@ def available_months(year):
             for fname in os.listdir(year_dir):
                 m = re.search(r'(\d{8})', fname)
                 if m and m.group(1)[:4] == str(year):
+                    if max_date and m.group(1) > max_date:
+                        continue
                     months.add(int(m.group(1)[4:6]))
-        else:
+        elif layout == "monthly_mm":
+            year_dir = os.path.join(root, str(year))
+            if not os.path.isdir(year_dir):
+                continue
+            for d in os.listdir(year_dir):
+                if d.isdigit() and len(d) == 2:
+                    month_num = int(d)
+                    if max_date and f"{year}{d}" > max_date[:6]:
+                        continue
+                    months.add(month_num)
+        else:  # monthly (YYYYMM subdirs)
             year_dir = os.path.join(root, str(year))
             if not os.path.isdir(year_dir):
                 continue
             for d in os.listdir(year_dir):
                 if d.isdigit() and len(d) == 6 and d[:4] == str(year):
+                    if max_date and d > max_date[:6]:
+                        continue
                     months.add(int(d[4:6]))
     return sorted(months)
 
@@ -237,15 +325,31 @@ def available_months(year):
 def _open_nc(path):
     """Open a NetCDF file and return an in-memory Dataset, or None."""
     try:
-        ds = xr.open_dataset(path)
+        with _nc_lock:
+            ds = xr.open_dataset(path)
+            ds.load()   # pull all data into numpy arrays
+            ds.close()  # release file handle (data stays in RAM)
         if "time" not in ds or ds.time.size == 0:
-            ds.close()
             return None
+        # Old met-sensors format uses 'pressure'; rename to AMOF standard name
         if "air_pressure" not in ds:
-            ds.close()
-            return None
-        ds.load()   # pull all data into numpy arrays
-        ds.close()  # release file handle (data stays in RAM)
+            if "pressure" in ds:
+                ds = ds.rename({"pressure": "air_pressure"})
+            else:
+                return None
+        # Convert Pa → hPa if units attribute says Pa or values are implausibly large
+        if ds["air_pressure"].attrs.get("units", "").upper() in ("PA", "PASCAL", "PASCALS") \
+                or ds["air_pressure"].values.mean() > 10000:
+            ds["air_pressure"].values[:] /= 100.0
+            ds["air_pressure"].attrs["units"] = "hPa"
+        # Mask unphysical values (sensor artefacts: 0 Pa, stuck-at-90000 Pa, etc.)
+        # Real data at Chilbolton sits ~950–1040 hPa.  The all-time UK record low
+        # is ~914 hPa; artefact values cluster at 0 and ~900–902 hPa.  Use 920 hPa
+        # as a lower bound: safely above the artefacts, safely below any real data.
+        p = ds["air_pressure"].values
+        bad = (p < 920) | (p > 1100)
+        if bad.any():
+            p[bad] = np.nan
         return ds
     except Exception:
         return None
@@ -254,21 +358,58 @@ def _open_nc(path):
 def _open_nc_trh(path):
     """Open a temp/RH NetCDF file and return an in-memory Dataset, or None."""
     try:
-        ds = xr.open_dataset(path)
+        with _nc_lock:
+            ds = xr.open_dataset(path)
+            ds.load()   # pull all data into numpy arrays
+            ds.close()  # release file handle (data stays in RAM)
         if "time" not in ds or ds.time.size == 0:
-            ds.close()
             return None
+        # Old met-sensors format uses 'temperature' and 'rh'; rename to AMOF standard
+        if "air_temperature" not in ds and "temperature" in ds:
+            ds = ds.rename({"temperature": "air_temperature"})
+        if "relative_humidity" not in ds and "rh" in ds:
+            ds = ds.rename({"rh": "relative_humidity"})
         if "air_temperature" not in ds and "relative_humidity" not in ds:
-            ds.close()
             return None
-        ds.load()   # pull all data into numpy arrays
-        ds.close()  # release file handle (data stays in RAM)
         # Convert temperature from Kelvin to Celsius if stored in K
         if "air_temperature" in ds:
             if ds["air_temperature"].attrs.get("units", "").upper() in ("K", "KELVIN") \
                     or ds["air_temperature"].values.mean() > 200:
                 ds["air_temperature"].values[:] -= 273.15
                 ds["air_temperature"].attrs["units"] = "degC"
+            # Mask unphysical values (0 K artefacts, sensor faults, un-declared fill values).
+            # Antarctic record low is -89.2°C; use -80°C as lower bound.
+            # Global record high is +56.7°C; use +65°C as upper bound.
+            t = ds["air_temperature"].values
+            bad_t = (t < -80) | (t > 65)
+            if bad_t.any():
+                t[bad_t] = np.nan
+        # Derive relative humidity from dew point when RH is not directly available
+        # (met-sensors files before ~2008 have 'dew_point' but no 'rh').
+        # Uses the August-Roche-Magnus approximation (T in °C):
+        #   e_s(T) ∝ exp(17.625·T / (243.04 + T))  →  RH = 100 · e_s(Td) / e_s(Ta)
+        if "relative_humidity" not in ds and "dew_point" in ds and "air_temperature" in ds:
+            td = ds["dew_point"].values.copy().astype(float)
+            if ds["dew_point"].attrs.get("units", "").upper() in ("K", "KELVIN") \
+                    or np.nanmean(td[np.isfinite(td)]) > 100:
+                td -= 273.15  # K → °C
+            ta = ds["air_temperature"].values  # already in °C
+            rh_derived = 100.0 * (
+                np.exp(17.625 * td / (243.04 + td)) /
+                np.exp(17.625 * ta / (243.04 + ta))
+            )
+            rh_derived = np.where(np.isfinite(rh_derived), rh_derived, np.nan)
+            ds["relative_humidity"] = xr.DataArray(
+                rh_derived.astype(np.float32),
+                dims=["time"],
+                attrs={"units": "%", "long_name": "relative humidity derived from dew point temperature"},
+            )
+        # Mask unphysical relative humidity values
+        if "relative_humidity" in ds:
+            rh = ds["relative_humidity"].values
+            bad_rh = (rh < 0) | (rh > 110)
+            if bad_rh.any():
+                rh[bad_rh] = np.nan
         # Add placeholder QC flags (all-1 = good) for any absent QC variable so that
         # xr.concat across files with mixed QC presence does not produce NaN-filled arrays
         # that would cause data points to be silently dropped from plots.
@@ -355,15 +496,35 @@ def load_date_range_trh(start_date, end_date):
 def _open_nc_rain(path):
     """Open a rain gauge NetCDF, compute rainfall_rate (mm/hr), return in-memory Dataset or None."""
     try:
-        ds = xr.open_dataset(path)
+        with _nc_lock:
+            ds = xr.open_dataset(path)
+            ds.load()
+            ds.close()
         if "time" not in ds or ds.time.size == 0:
-            ds.close()
             return None
+        # Old BADC cfarr-multiple-raingauges format: derive thickness_of_rainfall_amount.
+        # Prefer drop_count_b (RAL Mk.IV drop-counter, ~0.004 mm/drop, higher resolution).
+        # Fall back to tipping_bucket_a (R.W.Munro R100, 0.2 mm/tip).
         if "thickness_of_rainfall_amount" not in ds:
-            ds.close()
+            if "drop_count_b" in ds:
+                mm_per_drop = 0.004  # RAL Mk.IV: 0.004 mm/drop (fixed calibration)
+                drops = ds["drop_count_b"].values.astype(float)
+                drops = np.where(np.isfinite(drops) & (drops >= 0), drops, np.nan)
+                ds["thickness_of_rainfall_amount"] = xr.DataArray(
+                    (drops * mm_per_drop).astype("float32"), dims=["time"],
+                    attrs={"units": "mm",
+                           "long_name": "thickness of rainfall amount (from drop count)"},
+                )
+            elif "tipping_bucket_a" in ds:
+                tips = ds["tipping_bucket_a"].values.astype(float)
+                tips = np.where(tips >= 0, tips, np.nan)
+                ds["thickness_of_rainfall_amount"] = xr.DataArray(
+                    (tips * 0.2).astype("float32"), dims=["time"],
+                    attrs={"units": "mm",
+                           "long_name": "thickness of rainfall amount (from tipping bucket count)"},
+                )
+        if "thickness_of_rainfall_amount" not in ds:
             return None
-        ds.load()
-        ds.close()
         # Derive rainfall rate: accumulation (mm) per 10-s interval → mm/hr
         times = pd.to_datetime(ds["time"].values)
         dt_s = pd.Series(times).diff().dt.total_seconds().fillna(10).values
@@ -428,15 +589,14 @@ def load_date_range_rain(start_date, end_date):
 def _open_nc_anem(path):
     """Open an anemometer NetCDF and return an in-memory Dataset, or None."""
     try:
-        ds = xr.open_dataset(path)
-        if "time" not in ds or ds.time.size == 0:
+        with _nc_lock:
+            ds = xr.open_dataset(path)
+            ds.load()
             ds.close()
+        if "time" not in ds or ds.time.size == 0:
             return None
         if "wind_speed" not in ds and "wind_from_direction" not in ds and "wind_direction" not in ds:
-            ds.close()
             return None
-        ds.load()
-        ds.close()
         # Old cfarr-format files use wind_direction; rename to match AMOF standard
         if "wind_direction" in ds and "wind_from_direction" not in ds:
             ds = ds.rename({"wind_direction": "wind_from_direction"})
@@ -444,6 +604,19 @@ def _open_nc_anem(path):
         squeeze_dims = [d for d in ["latitude", "longitude"] if d in ds.sizes and ds.sizes[d] == 1]
         if squeeze_dims:
             ds = ds.squeeze(squeeze_dims, drop=True)
+        # Mask unphysical values (e.g. whole-day sensor faults where all channels
+        # contain garbage values in the 0–300 range).
+        # WMO surface wind speed record is ~113 m/s; use 100 m/s as upper bound.
+        if "wind_speed" in ds:
+            ws = ds["wind_speed"].values
+            bad_ws = (ws < 0) | (ws > 100)
+            if bad_ws.any():
+                ws[bad_ws] = np.nan
+        if "wind_from_direction" in ds:
+            wd = ds["wind_from_direction"].values
+            bad_wd = (wd < 0) | (wd > 360)
+            if bad_wd.any():
+                wd[bad_wd] = np.nan
         return ds
     except Exception:
         return None
@@ -510,9 +683,10 @@ def _build_download_dataset(source, start, end):
     datasets = []
     for f in files:
         try:
-            ds = xr.open_dataset(f)
-            ds.load()
-            ds.close()
+            with _nc_lock:
+                ds = xr.open_dataset(f)
+                ds.load()
+                ds.close()
             if source == "anem":
                 squeeze_dims = [d for d in ["latitude", "longitude"]
                                 if d in ds.sizes and ds.sizes[d] == 1]
@@ -839,17 +1013,30 @@ def _build_multi_range_fig(ds_pressure, ds_trh, ds_rain, ds_anem, start, end):
 # ReObs plot
 # ---------------------------------------------------------------------------
 
+# Discrete rainfall colorscale matching the UK Met Office / NIMROD radar palette.
+# Eight flat-colour bands; zmin=0, zmax=32 mm/hr.  Values > 32 clip to dark red.
+_RAIN_REOBS_COLORSCALE = [
+    [0.000000, "#000080"], [0.015625, "#000080"],  # < 0.5  navy
+    [0.015625, "#3399FF"], [0.031250, "#3399FF"],  # 0.5–1  sky blue
+    [0.031250, "#00AA00"], [0.062500, "#00AA00"],  # 1–2    green
+    [0.062500, "#AAFF00"], [0.125000, "#AAFF00"],  # 2–4    lime
+    [0.125000, "#FFCC00"], [0.250000, "#FFCC00"],  # 4–8    amber
+    [0.250000, "#FF8000"], [0.500000, "#FF8000"],  # 8–16   orange
+    [0.500000, "#FF0000"], [0.999999, "#FF0000"],  # 16–32  red
+    [0.999999, "#880000"], [1.000000, "#880000"],  # > 32   dark red
+]
+
 _REOBS_COLORSCALE = {
     "air_pressure":        "RdYlBu",
     "air_temperature":     "RdYlBu_r",
     "relative_humidity":   "YlGnBu",
-    "rainfall_rate":       "Blues",
+    "rainfall_rate":       _RAIN_REOBS_COLORSCALE,
     "wind_speed":          "YlOrRd",
     "wind_from_direction": "HSV",
 }
 
 
-def _build_reobs_fig(variable_key):
+def _build_reobs_fig(variable_key, year_min=None, year_max=None):
     """Build a ReObs-style heatmap: time-of-day × day-of-year, stacked by year."""
     cfg = VARIABLES[variable_key]
     source = cfg["source"]
@@ -880,8 +1067,28 @@ def _build_reobs_fig(variable_key):
         return fig
 
     years = sorted(all_years)
-    BIN_MINUTES = 30
-    BINS_PER_DAY = 24 * 60 // BIN_MINUTES   # 48 bins
+    # Apply user-selected year range
+    if year_min is not None:
+        years = [y for y in years if y >= year_min]
+    if year_max is not None:
+        years = [y for y in years if y <= year_max]
+    if not years:
+        fig = _empty_fig()
+        fig.update_layout(title=f"No data in selected year range for {cfg['label']}")
+        return fig
+    # Rainfall ReObs uses hourly accumulations (sum of per-interval mm amounts).
+    # All other variables use 30-minute mean bins.
+    if variable_key == "rainfall_rate":
+        BIN_MINUTES = 60
+        reobs_var = "rainfall_amount"   # mm per instrument interval, summed per hour
+        reobs_agg = "sum"
+        colorbar_title = "Hourly rainfall (mm)"
+    else:
+        BIN_MINUTES = 30
+        reobs_var = var_name
+        reobs_agg = "mean"
+        colorbar_title = cfg["ylabel"].replace("<br>", " ")
+    BINS_PER_DAY = 24 * 60 // BIN_MINUTES
     N_DAYS = 366
     GAP_ROWS = 1                             # NaN separator between year bands
     y_per_year = BINS_PER_DAY + GAP_ROWS
@@ -897,14 +1104,28 @@ def _build_reobs_fig(variable_key):
             datasets = [ds for ds in ex.map(open_fn, all_files) if ds is not None]
         if not datasets:
             return year, None
+        # Strip each dataset to only the needed variables + time dimension,
+        # dropping non-index coordinates (latitude, longitude, etc.) that
+        # differ between met-sensors and NCAS file formats and cause concat to fail.
+        keep_vars = {reobs_var}
+        if qc_key:
+            keep_vars.add(qc_key)
+        datasets_clean = []
+        for ds in datasets:
+            if reobs_var not in ds:
+                continue
+            ds_clean = ds[[v for v in keep_vars if v in ds]].reset_coords(drop=True)
+            datasets_clean.append(ds_clean)
+        if not datasets_clean:
+            return year, None
         try:
-            combined = xr.concat(datasets, dim="time")
+            combined = xr.concat(datasets_clean, dim="time", data_vars="all")
         except Exception:
             return year, None
-        if var_name not in combined:
+        if reobs_var not in combined:
             return year, None
         times = pd.to_datetime(combined["time"].values)
-        values = combined[var_name].values.astype(float)
+        values = combined[reobs_var].values.astype(float)
         if qc_key and qc_key in combined:
             qc = combined[qc_key].values
             values = np.where(qc == 2, np.nan, values)
@@ -917,7 +1138,7 @@ def _build_reobs_fig(variable_key):
             return year, None
         pivot = (
             df.groupby(["bin", "doy"])["v"]
-            .mean()
+            .agg(reobs_agg)
             .unstack(level=1)
             .reindex(index=range(BINS_PER_DAY), columns=range(N_DAYS))
         )
@@ -941,13 +1162,15 @@ def _build_reobs_fig(variable_key):
             tickvals.append(ro + (h * 60) // BIN_MINUTES)
             ticktext.append(str(h))
 
-    # Year labels as right-hand annotations
+    # Year labels as right-hand annotations (rotated 90°)
     annotations = [
         dict(
             xref="paper", x=1.01,
             yref="y", y=yi * y_per_year + BINS_PER_DAY // 2,
             text=str(year), showarrow=False,
-            xanchor="left", font=dict(size=10),
+            xanchor="left", yanchor="middle",
+            font=dict(size=10),
+            textangle=90,
         )
         for yi, year in enumerate(years)
     ]
@@ -965,15 +1188,25 @@ def _build_reobs_fig(variable_key):
     ]
 
     colorscale = _REOBS_COLORSCALE.get(variable_key, "RdYlBu_r")
-    colorbar_title = cfg["ylabel"].replace("<br>", " ")
 
-    fig = go.Figure(go.Heatmap(
+    heatmap_kwargs = dict(
         z=z,
         x=list(range(1, N_DAYS + 1)),
         colorscale=colorscale,
-        colorbar=dict(title=dict(text=colorbar_title, side="right")),
+        colorbar=dict(title=dict(text=colorbar_title, side="right"), x=1.08),
         hovertemplate="Day %{x}<br>Value: %{z:.2f}<extra></extra>",
-    ))
+    )
+    if variable_key == "rainfall_rate":
+        heatmap_kwargs["zmin"] = 0
+        heatmap_kwargs["zmax"] = 32
+        heatmap_kwargs["colorbar"] = dict(
+            title=dict(text=colorbar_title, side="right"),
+            x=1.08,
+            tickvals=[0, 0.5, 1, 2, 4, 8, 16, 32],
+            ticktext=["0", "0.5", "1", "2", "4", "8", "16", "≥32"],
+        )
+
+    fig = go.Figure(go.Heatmap(**heatmap_kwargs))
     fig.update_layout(
         title=f"ReObs \u2014 {cfg['label']}",
         xaxis=dict(title="Day of year", tickvals=list(range(10, 367, 10))),
@@ -999,7 +1232,11 @@ default_end = datetime.date.today()
 default_start = (default_end - datetime.timedelta(days=30)).isoformat()
 default_end = default_end.isoformat()
 
-app = dash.Dash(__name__, title="Chilbolton Surface Meteorology Explorer")
+app = dash.Dash(
+    __name__,
+    title="Chilbolton Surface Meteorology Explorer",
+    requests_pathname_prefix=os.environ.get("DASH_REQUESTS_PATHNAME_PREFIX", "/"),
+)
 
 app.layout = html.Div(
     [
@@ -1115,6 +1352,7 @@ app.layout = html.Div(
             style={"display": "flex", "alignItems": "flex-start", "margin": "0 16px"},
         ),
         dcc.Store(id="detail-range-store"),
+        dcc.Store(id="reobs-years-store"),
         dcc.Download(id="download-nc"),
         # ── ReObs ────────────────────────────────────────────────────────────
         html.Hr(style={"margin": "24px 0 16px"}),
@@ -1146,6 +1384,32 @@ app.layout = html.Div(
                             clearable=False,
                             style={"width": "280px", "marginRight": "12px"},
                         ),
+                        html.Label(
+                            "From:",
+                            style={"marginRight": "6px", "fontFamily": "sans-serif"},
+                        ),
+                        dcc.Dropdown(
+                            id="reobs-year-min",
+                            options=[{"label": str(y), "value": y}
+                                     for y in available_years()],
+                            value=None,
+                            clearable=True,
+                            placeholder="earliest",
+                            style={"width": "110px", "marginRight": "12px"},
+                        ),
+                        html.Label(
+                            "To:",
+                            style={"marginRight": "6px", "fontFamily": "sans-serif"},
+                        ),
+                        dcc.Dropdown(
+                            id="reobs-year-max",
+                            options=[{"label": str(y), "value": y}
+                                     for y in available_years()],
+                            value=None,
+                            clearable=True,
+                            placeholder="latest",
+                            style={"width": "110px", "marginRight": "12px"},
+                        ),
                         html.Button(
                             "Generate",
                             id="reobs-btn",
@@ -1162,6 +1426,23 @@ app.layout = html.Div(
                 dcc.Loading(
                     dcc.Graph(id="reobs-graph", figure=_empty_fig()),
                     type="circle",
+                ),
+                html.Div(
+                    id="reobs-detail-container",
+                    children=[
+                        html.Hr(style={"margin": "16px 0 8px"}),
+                        html.P(
+                            "Click a cell in the ReObs heatmap to load the full day detail below.",
+                            style={"fontFamily": "sans-serif", "color": "#666",
+                                   "fontSize": "0.9em", "margin": "0 0 4px"},
+                        ),
+                        dcc.Loading(
+                            dcc.Graph(id="reobs-detail-graph", figure=_empty_fig(),
+                                      style={"height": "900px"}),
+                            type="circle",
+                        ),
+                    ],
+                    style={"display": "none"},
                 ),
             ],
             style={"margin": "0 16px 24px"},
@@ -1421,14 +1702,76 @@ def download_netcdf(n_clicks, store):
 
 @callback(
     Output("reobs-graph", "figure"),
+    Output("reobs-years-store", "data"),
     Input("reobs-btn", "n_clicks"),
     State("reobs-variable", "value"),
+    State("reobs-year-min", "value"),
+    State("reobs-year-max", "value"),
     prevent_initial_call=True,
 )
-def update_reobs(n_clicks, variable_key):
+def update_reobs(n_clicks, variable_key, year_min, year_max):
     if not variable_key:
-        return _empty_fig()
-    return _build_reobs_fig(variable_key)
+        return _empty_fig(), dash.no_update
+    # Discover the years used so the click callback can decode row → year.
+    source_map = {
+        "pressure": PRESSURE_ROOTS,
+        "trh":      TRH_ROOTS,
+        "rain":     RAIN_ROOTS,
+        "anem":     ANEM_ROOTS,
+    }
+    roots = source_map.get(VARIABLES[variable_key]["source"], PRESSURE_ROOTS)
+    all_years = set()
+    for root_entry in roots:
+        root = root_entry[0]
+        if not os.path.isdir(root):
+            continue
+        for d in os.listdir(root):
+            if d.isdigit() and len(d) == 4 and os.path.isdir(os.path.join(root, d)):
+                all_years.add(int(d))
+    years = sorted(all_years)
+    if year_min is not None:
+        years = [y for y in years if y >= year_min]
+    if year_max is not None:
+        years = [y for y in years if y <= year_max]
+    y_per_year = 25 if variable_key == "rainfall_rate" else 49
+    store = {"years": years, "y_per_year": y_per_year}
+    return _build_reobs_fig(variable_key, year_min=year_min, year_max=year_max), store
+
+
+@callback(
+    Output("reobs-detail-graph", "figure"),
+    Output("reobs-detail-container", "style"),
+    Input("reobs-graph", "clickData"),
+    State("reobs-years-store", "data"),
+    prevent_initial_call=True,
+)
+def update_reobs_detail(click_data, store):
+    visible = {"display": "block"}
+    if not click_data or not store:
+        return _empty_fig(), visible
+    point = click_data["points"][0]
+    doy = int(point["x"])          # 1-indexed day of year
+    y_row = int(point["y"])        # heatmap row index
+    years = store.get("years", [])
+    y_per_year = store.get("y_per_year", 49)
+    yi = y_row // y_per_year
+    if not years or yi >= len(years):
+        return _empty_fig(), visible
+    year = years[yi]
+    try:
+        date = (datetime.date(year, 1, 1) + datetime.timedelta(days=doy - 1))
+    except (ValueError, OverflowError):
+        return _empty_fig(), visible
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut_p = ex.submit(load_day, date.year, date.month, date.day)
+        fut_t = ex.submit(load_day_trh, date.year, date.month, date.day)
+        fut_r = ex.submit(load_day_rain, date.year, date.month, date.day)
+        fut_a = ex.submit(load_day_anem, date.year, date.month, date.day)
+    ds_pressure = fut_p.result()
+    ds_trh = fut_t.result()
+    ds_rain = fut_r.result()
+    ds_anem = fut_a.result()
+    return _build_multi_day_fig(ds_pressure, ds_trh, ds_rain, ds_anem, date), visible
 
 
 if __name__ == "__main__":
