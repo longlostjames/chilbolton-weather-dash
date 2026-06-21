@@ -1008,13 +1008,13 @@ def _build_reobs_fig(variable_key, year_min=None, year_max=None):
         fig = _empty_fig()
         fig.update_layout(title=f"No data in selected year range for {cfg['label']}")
         return fig
-    # All variables use 30-minute bins.
-    # Rainfall ReObs shows cumulative daily rainfall (applied after z assembly).
+    # Rainfall ReObs uses hourly accumulations (sum of per-interval mm amounts).
+    # All other variables use 30-minute mean bins.
     if variable_key == "rainfall_rate":
-        BIN_MINUTES = 30
-        reobs_var = "rainfall_amount"   # mm per instrument interval, summed per bin
+        BIN_MINUTES = 60
+        reobs_var = "rainfall_amount"   # mm per instrument interval, summed per hour
         reobs_agg = "sum"
-        colorbar_title = "Cumulative daily rainfall (mm)"
+        colorbar_title = "Hourly rainfall (mm)"
     else:
         BIN_MINUTES = 30
         reobs_var = var_name
@@ -1089,18 +1089,6 @@ def _build_reobs_fig(variable_key, year_min=None, year_max=None):
         if arr is not None:
             z[yi * y_per_year: yi * y_per_year + BINS_PER_DAY, :] = arr
 
-    # For rainfall, convert per-bin amounts to cumulative daily totals.
-    # Days with no data at all stay NaN; within a day, missing bins are
-    # treated as zero (no rain observed) for the running accumulation.
-    if variable_key == "rainfall_rate":
-        for yi in range(len(years)):
-            band = z[yi * y_per_year: yi * y_per_year + BINS_PER_DAY, :]
-            has_data = ~np.all(np.isnan(band), axis=0)
-            filled = np.where(np.isnan(band), 0.0, band)
-            cumband = np.cumsum(filled, axis=0)
-            cumband[:, ~has_data] = np.nan
-            z[yi * y_per_year: yi * y_per_year + BINS_PER_DAY, :] = cumband
-
     # Y-axis ticks: 0, 6, 12, 18 for every year band
     tickvals, ticktext = [], []
     for yi in range(len(years)):
@@ -1145,12 +1133,12 @@ def _build_reobs_fig(variable_key, year_min=None, year_max=None):
     )
     if variable_key == "rainfall_rate":
         heatmap_kwargs["zmin"] = 0
-        heatmap_kwargs["zmax"] = 30
+        heatmap_kwargs["zmax"] = 32
         heatmap_kwargs["colorbar"] = dict(
             title=dict(text=colorbar_title, side="right"),
             x=1.08,
-            tickvals=[0, 1, 2, 5, 10, 20, 30],
-            ticktext=["0", "1", "2", "5", "10", "20", "≥30"],
+            tickvals=[0, 0.5, 1, 2, 4, 8, 16, 32],
+            ticktext=["0", "0.5", "1", "2", "4", "8", "16", "≥32"],
         )
 
     fig = go.Figure(go.Heatmap(**heatmap_kwargs))
@@ -1681,7 +1669,7 @@ def update_reobs(n_clicks, variable_key, year_min, year_max):
         years = [y for y in years if y >= year_min]
     if year_max is not None:
         years = [y for y in years if y <= year_max]
-    y_per_year = 49  # all variables now use 30-minute bins
+    y_per_year = 25 if variable_key == "rainfall_rate" else 49
     store = {"years": years, "y_per_year": y_per_year}
     try:
         fig = _build_reobs_fig(variable_key, year_min=year_min, year_max=year_max)
