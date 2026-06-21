@@ -1644,6 +1644,7 @@ def download_netcdf(n_clicks, store):
     prevent_initial_call=True,
 )
 def update_reobs(n_clicks, variable_key, year_min, year_max):
+    print(f"[DEBUG] update_reobs called: variable={variable_key!r}, year_min={year_min!r}, year_max={year_max!r}", flush=True)
     if not variable_key:
         return _empty_fig(), dash.no_update
     # Discover the years used so the click callback can decode row → year.
@@ -1669,7 +1670,15 @@ def update_reobs(n_clicks, variable_key, year_min, year_max):
         years = [y for y in years if y <= year_max]
     y_per_year = 25 if variable_key == "rainfall_rate" else 49
     store = {"years": years, "y_per_year": y_per_year}
-    return _build_reobs_fig(variable_key, year_min=year_min, year_max=year_max), store
+    try:
+        fig = _build_reobs_fig(variable_key, year_min=year_min, year_max=year_max)
+        print(f"[DEBUG] _build_reobs_fig succeeded for {variable_key!r}, title={fig.layout.title.text!r}", flush=True)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        fig = _empty_fig()
+        fig.update_layout(title=f"ReObs error [{type(exc).__name__}]: {exc}")
+    return fig, store
 
 
 @callback(
