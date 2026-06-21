@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Interactive Dash app for exploring Chilbolton PTB110 air pressure data.
+Interactive Dash app for exploring Chilbolton meteorology data — wx2026 machine.
 
 Run with:
-    python app.py [--port 8050] [--host 127.0.0.1]
+    python app_wx2026.py [--port 8050] [--host 127.0.0.1]
 
 Access via SSH local port forwarding:
-    ssh -L 8050:localhost:8050 <username>@<jasmin-host>
+    ssh -L 8050:localhost:8050 <username>@wx2026
 Then open http://localhost:8050 in your browser.
 """
 
@@ -27,93 +27,24 @@ import xarray as xr
 from dash import Input, Output, Patch, State, callback, dcc, html
 
 # ---------------------------------------------------------------------------
-# Data roots — override with environment variables
-# Each entry is (root_dir, layout) where layout is "yearly" or "monthly".
-# "yearly"  → root/<year>/*.nc
-# "monthly" → root/<year>/<yearmonth>/*.nc
-# When multiple roots exist, the file with the highest version number
-# (_vX.Y in the filename) is preferred; newest mtime breaks ties.
+# Data roots — wx2026 machine paths
 # ---------------------------------------------------------------------------
-# BADC met-sensors (2001–2018, monthly, old cfarr format — pressure/temperature/rh/wind)
-MET_SENSORS_ROOT = os.environ.get(
-    "MET_SENSORS_ROOT",
-    "/badc/chilbolton/data/met-sensors_chilbolton",
-)
+MET_SENSORS_ROOT = "/data/wexp/cwalden/met-sensors"
 
 PRESSURE_ROOTS = [
-    # GWS (level1a, 2024–present, yearly).  BADC copy not readable.
-    (os.environ.get(
-        "PRESSURE_DATA_ROOT",
-        "/gws/pw/j07/ncas_obs_vol1/public/cao/stfc-pressure-1",
-    ), "yearly"),
-    # BADC met-sensors (2001–2018, monthly)
-    (MET_SENSORS_ROOT, "monthly_mm", None, "20240331"),
+    ("/data/wexp/cwalden/pressure", "yearly"),
+    (MET_SENSORS_ROOT, "yearly"),
 ]
 TRH_ROOTS = [
-    # BADC met-sensors (2001–2018, monthly) — fills gap before NCAS instrument archive
-    (MET_SENSORS_ROOT, "monthly_mm", None, "20181231"),
-    # BADC archive (2015–2024, yearly, v1.1) — takes priority via version number
-    (os.environ.get(
-        "TRH_DATA_ROOT",
-        "/badc/ncas-cao/data/ncas-temperature-rh-1/20150415_longterm/v1.1",
-    ), "yearly"),
-    # GWS long-term archive (2024-04-01 onwards, yearly)
-    (os.environ.get(
-        "TRH_GWS_LONGTERM_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-temperature-rh-1/20240401_longterm",
-    ), "yearly"),
-    # STFC upload (2024-04-01 onwards, yearly, v1.1)
-    (os.environ.get(
-        "TRH_STFC_ROOT",
-        "/gws/pw/j07/ncas_obs_vol1/public/cao/stfc-temperature-rh-1",
-    ), "yearly", "20240401"),
+    ("/data/wexp/cwalden/temperature-rh", "yearly"),
+    (MET_SENSORS_ROOT, "yearly"),
 ]
 RAIN_ROOTS = [
-    # GWS monthly layout (2025–present, monthly) — v1.0 AMOF format
-    (os.environ.get(
-        "RAIN_GWS_MONTHLY_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term",
-    ), "monthly", "20250101"),
-    # GWS level1b (2020–2024, yearly, v1.0)
-    (os.environ.get(
-        "RAIN_DATA_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term/level1b",
-    ), "yearly", "20200101", "20241231"),
-    # GWS level1_f5 (2015–2020, yearly, v1.0) — AMOF format, fills the pre-2020 gap
-    (os.environ.get(
-        "RAIN_GWS_LEVEL1F5_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-rain-gauge-1/data/long-term/level1_f5",
-    ), "yearly", "20140401", "20201231"),
-    # BADC ncas-rain-gauge-1 (2001–2020, monthly_mm) — old tipping-bucket format;
-    # used only when no AMOF file exists (version (0,0) loses to v1.0).
-    (os.environ.get(
-        "RAIN_BADC_ROOT",
-        "/badc/ncas-cao/data/ncas-rain-gauge-1/20010101_longterm/previous_v1",
-    ), "monthly_mm", "20010101", "20201231"),
+    ("/data/wexp/cwalden/precipitation", "yearly"),
 ]
 ANEM_ROOTS = [
-    # GWS level1b (2010–present, yearly) — preferred; will cover 2025+ once data lands there
-    (os.environ.get(
-        "ANEM_DATA_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term/level1b",
-    ), "yearly"),
-    # GWS monthly layout (2025–present) — covers dates not yet in level1b
-    (os.environ.get(
-        "ANEM_GWS_MONTHLY_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term",
-    ), "monthly", "20250101"),
-     # GWS level1_f5 (2015–2020, yearly, v1.0) — AMOF format, fills the pre-level1b gap
-    (os.environ.get(
-        "ANEM_LEVEL1F5_ROOT",
-        "/gws/pw/j07/ncas_obs_vol2/cao/processing/ncas-anemometer-2/data/long-term/level1_f5",
-    ), "yearly", "20140401", "20201231"),
-    # BADC archive (2001–2020, monthly_mm, old cfarr format — wind_direction variable)
-    (os.environ.get(
-        "ANEM_BADC_ROOT",
-        "/badc/ncas-cao/data/ncas-anemometer-2/20010101_longterm/previous_v1",
-    ), "monthly_mm"),
-    # BADC met-sensors (2001–2018, monthly_mm) — fallback when ncas-anemometer-2 absent
-    (MET_SENSORS_ROOT, "monthly_mm", None, "20181231"),
+    ("/data/wexp/cwalden/mean-winds", "yearly"),
+    (MET_SENSORS_ROOT, "yearly"),
 ]
 
 # Keep simple aliases for _build_download_dataset compatibility
@@ -1779,7 +1710,7 @@ def update_reobs_detail(click_data, store):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Chilbolton PTB110 air pressure interactive explorer."
+        description="Chilbolton Surface Meteorology Explorer — wx2026 machine."
     )
     parser.add_argument(
         "--port", type=int, default=8050, help="Port to serve on (default: 8050)"
@@ -1789,29 +1720,5 @@ if __name__ == "__main__":
         default="127.0.0.1",
         help="Host to bind to (default: 127.0.0.1 for local port forwarding)",
     )
-    parser.add_argument(
-        "--data-root",
-        default=None,
-        help="Override the pressure NetCDF data root directory",
-    )
-    parser.add_argument(
-        "--base-root",
-        default=None,
-        help=(
-            "Base directory containing instrument subdirectories "
-            "(stfc-pressure-1, stfc-temperature-rh-1, stfc-rain-gauge-1, stfc-anemometer-2). "
-            "Overrides all individual data roots. Example: /data/range/new_netcdf"
-        ),
-    )
     args = parser.parse_args()
-
-    if args.base_root:
-        base = args.base_root
-        PRESSURE_ROOTS[:] = [(os.path.join(base, "stfc-pressure-1"), "yearly")]
-        TRH_ROOTS[:] = [(os.path.join(base, "stfc-temperature-rh-1"), "yearly")]
-        RAIN_ROOTS[:] = [(os.path.join(base, "stfc-rain-gauge-1"), "yearly")]
-        ANEM_ROOTS[:] = [(os.path.join(base, "stfc-anemometer-2"), "yearly")]
-    elif args.data_root:
-        DATA_ROOT = args.data_root
-
     app.run(debug=False, host=args.host, port=args.port)
