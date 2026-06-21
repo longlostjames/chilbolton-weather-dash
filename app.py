@@ -399,6 +399,7 @@ def _open_nc_trh(path):
                 np.exp(17.625 * ta / (243.04 + ta))
             )
             rh_derived = np.where(np.isfinite(rh_derived), rh_derived, np.nan)
+            rh_derived = np.clip(rh_derived, -200.0, 200.0)  # prevent float32 overflow; bad_rh mask handles >110
             ds["relative_humidity"] = xr.DataArray(
                 rh_derived.astype(np.float32),
                 dims=["time"],
