@@ -1114,7 +1114,8 @@ def _build_reobs_fig(variable_key, year_min=None, year_max=None):
             if not all_files:
                 _reobs_cache[_key] = None
                 return year, None
-            datasets = [ds for ds in (open_fn(f) for f in all_files) if ds is not None]
+            with ThreadPoolExecutor(max_workers=min(len(all_files), 8)) as ex:
+                datasets = [ds for ds in ex.map(open_fn, all_files) if ds is not None]
             if not datasets:
                 _reobs_cache[_key] = None
                 return year, None
