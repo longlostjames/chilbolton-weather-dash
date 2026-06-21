@@ -11,6 +11,7 @@ Then open http://localhost:8050 in your browser.
 """
 
 import argparse
+import contextlib
 import datetime
 import glob
 import os
@@ -104,7 +105,14 @@ VARIABLES = {
 # Global lock to serialise HDF5/netCDF4 file access across threads.
 # The HDF5 library is not thread-safe in its default (serial) build;
 # concurrent open() calls from multiple threads cause SIGSEGV.
-_nc_lock = threading.Lock()
+# Set REOBS_NC_PARALLEL=1 to disable the lock on systems where your
+# HDF5/netCDF4 build is thread-safe (most modern conda installs are).
+_NC_PARALLEL = os.environ.get("REOBS_NC_PARALLEL", "0") == "1"
+_nc_lock = contextlib.nullcontext() if _NC_PARALLEL else threading.Lock()
+
+# Per-variable per-year result cache: avoids reloading files on repeated
+# "Generate" clicks for the same variable.
+_reobs_cache: dict = {}  # key: (variable_key, year) → ndarray | None
 
 # ---------------------------------------------------------------------------
 # Helpers — multi-root file discovery
@@ -1026,16 +1034,20 @@ def _build_reobs_fig(variable_key, year_min=None, year_max=None):
     y_per_year = BINS_PER_DAY + GAP_ROWS
 
     def process_year(year):
-        """Load one year's files in parallel and return a binned (BINS_PER_DAY, N_DAYS) array."""
+        """Load one year's files and return a binned (BINS_PER_DAY, N_DAYS) array, using cache."""
+        _key = (variable_key, year)
+        if _key in _reobs_cache:
+            return year, _reobs_cache[_key]
         try:
             all_files = []
             for month in range(1, 13):
                 all_files.extend(_glob_month_files(roots, year, month))
             if not all_files:
+                _reobs_cache[_key] = None
                 return year, None
-            with ThreadPoolExecutor(max_workers=min(len(all_files), 8)) as ex:
-                datasets = [ds for ds in ex.map(open_fn, all_files) if ds is not None]
+            datasets = [ds for ds in (open_fn(f) for f in all_files) if ds is not None]
             if not datasets:
+                _reobs_cache[_key] = None
                 return year, None
             # Strip each dataset to only the needed variables + time dimension,
             # dropping non-index coordinates (latitude, longitude, etc.) that
@@ -1075,7 +1087,9 @@ def _build_reobs_fig(variable_key, year_min=None, year_max=None):
                 .unstack(level=1)
                 .reindex(index=range(BINS_PER_DAY), columns=range(N_DAYS))
             )
-            return year, pivot.values
+            result = pivot.values
+            _reobs_cache[_key] = result
+            return year, result
         except Exception:
             return year, None
 
