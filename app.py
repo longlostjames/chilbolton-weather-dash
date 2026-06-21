@@ -148,7 +148,7 @@ VARIABLES = {
         "source": "trh",
     },
     "rainfall_rate": {
-        "label": "Rainfall (10 s integration time)",
+        "label": "Rainfall",
         "var": "rainfall_rate",       # synthetic — computed from thickness_of_rainfall_amount
         "qc": "qc_flag",
         "ylabel": "Rainfall rate<br>(mm hr\u207b\u00b9)",
